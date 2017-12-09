@@ -1,43 +1,38 @@
-import os
-from tqdm import tqdm
-
-from config import consts, args
-from agent import Agent
-from preprocess import get_trajectories_dict
-
-
-def set_tensorboard():
-    if not os.path.isdir(os.path.join(args.indir, 'tensorboard')):
-        os.mkdir(os.path.join(args.indir, 'tensorboard'))
-
+import torch.multiprocessing as mp
 
 def main():
 
     # print args of current run
-    print("Welcome to Learning from Demonstration simulation")
-    print(' ' * 26 + 'Options')
+    logger.info("Welcome to Learning from Demonstration simulation")
+    logger.info(' ' * 26 + 'Simulation Hyperparameters')
     for k, v in vars(args).items():
-        print(' ' * 26 + k + ': ' + str(v))
+        logger.info(' ' * 26 + k + ': ' + str(v))
 
     data, meta = get_trajectories_dict()
-    set_tensorboard()
-    agent = Agent(data, meta)
 
-    if args.lfd:
-        print("Enter LfD Session, it might take a while")
-        agent.lfd()
+    with Experiment() as exp:
 
-    if args.train:
-        print("Enter Training Session, it might take ages")
-        agent.train()
+        if args.lfd:
+            logger.info("Enter LfD Session, it might take a while")
+            model = exp.lfd(meta, data)
 
-    if args.test:
-        print("Enter Testing Session, it should be fun")
-        agent.test()
+        if args.train:
+            logger.info("Enter Training Session, it might take ages")
+            model = exp.train(model)
 
-    print("End of simulation")
+        if args.test:
+            logger.info("Enter Testing Session, it should be fun")
+            exp.test(model)
+
+    logger.info("End of simulation")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
+    mp.set_start_method('forkserver')
+
+    from config import consts, args
+    from logger import logger
+    from preprocess import get_trajectories_dict
+    from experiment import Experiment
     main()
 

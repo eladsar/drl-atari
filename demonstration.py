@@ -3,9 +3,11 @@ from skimage import io, transform, color
 import torch
 import cv2
 import os
+import torch.utils.data
 
 from config import consts, args
 from preprocess import preprocess_screen
+
 
 class DemonstrationsDataset(torch.utils.data.Dataset):
     def __init__(self, data, meta):

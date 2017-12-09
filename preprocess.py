@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 import os
 import parse
 from tqdm import tqdm
@@ -6,6 +7,10 @@ import cv2
 
 from config import args, consts
 
+
+def convert_screen_to_rgb(img):
+    img = cv2.cvtColor(img.numpy(), cv2.COLOR_GRAY2RGB)
+    return torch.from_numpy(np.rollaxis(img, 2, 0))
 
 def preprocess_screen(img):
 
