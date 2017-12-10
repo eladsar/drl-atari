@@ -19,8 +19,7 @@ def boolean_feature(feature, default, help):
 # strings
 parser.add_argument('--game', type=str, default='spaceinvaders', help='ATARI game')
 parser.add_argument('--identifier', type=str, default='experimental', help='The name of the model to use')
-parser.add_argument('--screensdir', type=str, default='/dev/shm/sarafie/', help='Demonstrations directory')
-parser.add_argument('--indir', type=str, default='/data/sarafie/atari/atari_v2_release', help='Demonstration directory')
+parser.add_argument('--indir', type=str, default='/dev/shm/sarafie/atari/', help='Demonstration directory')
 parser.add_argument('--outdir', type=str, default='/data/sarafie/atari/results', help='Output directory')
 parser.add_argument('--logdir', type=str, default='/data/sarafie/atari/logs', help='Logs directory')
 
@@ -29,7 +28,7 @@ boolean_feature("load-model", False, 'Load the saved model if possible')
 boolean_feature("lfd", True, 'Train the model with demonstrations')
 boolean_feature("test", False, 'Test the learned model')
 boolean_feature("render", False, 'Render tested episode')
-boolean_feature("reuse-preprocessed-data", True, "Evaluate only")
+boolean_feature("reload-data", False, "Ignore loaded trajectories and load again")
 boolean_feature("cuda", True, "Use GPU environment for testing")
 boolean_feature("train", False, "Train Reinforcement learning agent")
 boolean_feature("comet", True, "Log results to comet")
@@ -49,6 +48,7 @@ parser.add_argument('--history-length', type=int, default=4, metavar='T', help='
 parser.add_argument('--clip', type=int, default=1, metavar='VALUE', help='Reward clipping (0 to disable)')
 parser.add_argument('--discount', type=float, default=0.99, metavar='γ', help='Discount factor')
 parser.add_argument('--update-interval', type=int, default=4096, metavar='STEPS', help='Number of traning iterations between baseline updates')
+parser.add_argument('--update-memory-interval', type=int, default=4096, metavar='STEPS', help='Number of steps between memory updates')
 
 
 # distributional RL
@@ -59,19 +59,17 @@ parser.add_argument('--n-steps', type=int, default=32, metavar='STEPS', help='Nu
 
 # dataloader
 parser.add_argument('--cpu-workers', type=int, default=32, help='How many CPUs will be used for the data loading')
-parser.add_argument('--gpu-workers', type=int, default=16, help='How many parallel processes feeds the GPUs in play mode')
+parser.add_argument('--gpu-workers', type=int, default=8, help='How many parallel processes feeds the GPUs in play mode')
 
 # train parameters
 parser.add_argument('--test-percentage', type=float, default=0.02, help='Percentage of test dataset')
 parser.add_argument('--n-tot', type=int, default=int(10e6), metavar='STEPS', help='Total number of training steps')
 parser.add_argument('--checkpoint-interval', type=int, default=4096, metavar='STEPS', help='Number of training steps between evaluations')
-parser.add_argument('--evaluate-interval', type=int, default=64, metavar='STEPS', help='Number of training steps between evaluations')
-
+parser.add_argument('--evaluate-frames', type=int, default=256, metavar='STEPS', help='Number of frames for test evaluation')
 
 # test parameters
-parser.add_argument('--test-episodes', type=int, default=32, metavar='STEPS', help='Number of test episodes')
+parser.add_argument('--test-episodes', type=int, default=64, metavar='STEPS', help='Number of test episodes')
 parser.add_argument('--max-episode-length', type=int, default=8192, metavar='STEPS', help='Maximum frame length of a single episode')
-
 
 # optimizer arguments
 parser.add_argument('--optimizer', type=str, default='adam', help='Optimizer type')

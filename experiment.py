@@ -93,12 +93,11 @@ class Experiment(object):
         self.writer.export_scalars_to_json(os.path.join(self.tensorboard_dir, "all_scalars.json"))
         self.writer.close()
 
-    def lfd(self, meta, data):
+    def lfd(self):
 
-        dataset = DemonstrationsDataset(data, meta)
-        agent = LfdAgent(dataset, dataset.meta['train'], dataset.meta['test'])
+        agent = LfdAgent()
         best = np.inf
-        eval = agent.evaluate(args.evaluate_interval, args.n_tot)
+        eval = agent.evaluate(args.evaluate_frames, args.n_tot)
         play = agent.play(args.test_episodes, args.n_tot)
 
         # save graph to tensorboard
@@ -124,42 +123,20 @@ class Experiment(object):
 
             logger.info(" ")
             #  log to screen and logger
-            logger.info("Evaluation @ n=%d, epoch=%d, step=%d | Avg. Test Loss: %g |  Avg. Train Loss: %g "
-                        % (n, train_results['epoch'][-1], train_results['n'][-1], avg_test_loss, avg_train_loss))
+            logger.info("Evaluation @ n=%d, step=%d | Avg. Test Loss: %g |  Avg. Train Loss: %g "
+                        % (n, train_results['n'][-1], avg_test_loss, avg_train_loss))
 
             logger.info(" ")
             logger.info("Layers statistics:")
-            logger.info(" ")
-            logger.info("conv1:")
-            logger.info("weights norm: %s" % str(agent.model.module.conv1.weight.data.norm()))
-            logger.info("bias norm: %s" % str(agent.model.module.conv1.bias.data.norm()))
-            logger.info("weights-grad norm: %s" % str(agent.model.module.conv1.weight.grad.data.norm()))
-            logger.info("bias-grad norm: %s" % str(agent.model.module.conv1.bias.grad.data.norm()))
-            logger.info(" ")
-            logger.info("conv2:")
-            logger.info("weights norm: %s" % str(agent.model.module.conv2.weight.data.norm()))
-            logger.info("bias norm: %s" % str(agent.model.module.conv2.bias.data.norm()))
-            logger.info("weights-grad norm: %s" % str(agent.model.module.conv2.weight.grad.data.norm()))
-            logger.info("bias-grad norm: %s" % str(agent.model.module.conv2.bias.grad.data.norm()))
-            logger.info(" ")
-            logger.info("conv3:")
-            logger.info("weights norm: %s" % str(agent.model.module.conv3.weight.data.norm()))
-            logger.info("bias norm: %s" % str(agent.model.module.conv3.bias.data.norm()))
-            logger.info("weights-grad norm: %s" % str(agent.model.module.conv3.weight.grad.data.norm()))
-            logger.info("bias-grad norm: %s" % str(agent.model.module.conv3.bias.grad.data.norm()))
-            logger.info(" ")
-            logger.info("fc4:")
-            logger.info("fc4 weights norm: %s" % str(agent.model.module.fc4.weight.data.norm()))
-            logger.info("fc4 bias norm: %s" % str(agent.model.module.fc4.bias.data.norm()))
-            logger.info("fc4 weights-grad norm: %s" % str(agent.model.module.fc4.weight.grad.data.norm()))
-            logger.info("fc4 bias-grad norm: %s" % str(agent.model.module.fc4.bias.grad.data.norm()))
-            logger.info(" ")
-            logger.info("fc5:")
-            logger.info("weights norm: %s" % str(agent.model.module.fc5.weight.data.norm()))
-            logger.info("bias norm: %s" % str(agent.model.module.fc5.bias.data.norm()))
-            logger.info("weights-grad norm: %s" % str(agent.model.module.fc5.weight.grad.data.norm()))
-            logger.info("bias-grad norm: %s" % str(agent.model.module.fc5.bias.grad.data.norm()))
-            logger.info(" ")
+            for name, module in list(agent.model.named_modules()):
+                if "." not in name:
+                    continue
+                logger.info(" ")
+                logger.info("%s:" % name.split(".")[-1])
+                logger.info("weights norm: %s" % str(module.weight.data.norm()))
+                logger.info("bias norm: %s" % str(module.bias.data.norm()))
+                logger.info("weights-grad norm: %s" % str(module.weight.grad.data.norm()))
+                logger.info("bias-grad norm: %s" % str(module.bias.grad.data.norm()))
 
             # Log to Comet.ml
             if args.comet:
@@ -169,7 +146,6 @@ class Experiment(object):
 
                 self.comet.log_metric("test_loss", avg_test_loss)
                 self.comet.log_metric("train_loss", avg_train_loss)
-                self.comet.log_metric("epoch", train_results['epoch'][-1])
                 self.comet.log_metric("avg_score", avg_score)
                 self.comet.log_metric("std_score", std_score)
 

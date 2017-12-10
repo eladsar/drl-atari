@@ -1,5 +1,6 @@
 import torch
 import torch.utils.data
+import torch.utils.data.sampler
 from torch.autograd import Variable
 import numpy as np
 from tqdm import tqdm
@@ -8,6 +9,7 @@ import torch.multiprocessing as mp
 from config import consts, args
 from model import DQN
 from environment import Env
+from memory import DemonstrationMemory, DemonstrationBatchSampler
 
 
 def player(env, queue, jobs, done, myid):
@@ -39,22 +41,6 @@ def player(env, queue, jobs, done, myid):
 
     env.close()
 
-# # A working example for new process for each iteration
-# def player(env,  model, queue):
-#
-#     print("I am Here")
-#
-#     env.reset()
-#     while not env.t:
-#
-#         s = Variable(env.s, requires_grad=False)
-#
-#         a = model(s)
-#         a = a.data.cpu().numpy()
-#         a = np.argmax(a)
-#         env.step(a)
-#
-#     queue.put(env.score)
 
 class Agent(object):
 
@@ -104,19 +90,21 @@ class Agent(object):
 
 class LfdAgent(Agent):
 
-    def __init__(self, dataset, train_samples, test_samples):
+    def __init__(self):
 
         super(Agent, self).__init__()
 
-        self.train_sampler = torch.utils.data.sampler.SubsetRandomSampler(train_samples)
-        self.test_sampler = torch.utils.data.sampler.SubsetRandomSampler(test_samples)
-
         #
-        self.train_loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch, sampler=self.train_sampler,
-                                                        batch_sampler=None,
+        train_dataset = DemonstrationMemory("train")
+        test_dataset = DemonstrationMemory("test")
+
+        train_sampler = DemonstrationBatchSampler(train_dataset, args.batch, False)
+        test_sampler = DemonstrationBatchSampler(test_dataset, args.batch, False)
+
+
+        self.train_loader = torch.utils.data.DataLoader(train_dataset, batch_sampler=train_sampler,
                                                         num_workers=args.cpu_workers, pin_memory=True, drop_last=False)
-        self.test_loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch,
-                                                       sampler=self.test_sampler, batch_sampler=None,
+        self.test_loader = torch.utils.data.DataLoader(test_dataset, batch_sampler=test_sampler,
                                                        num_workers=args.cpu_workers, pin_memory=True, drop_last=False)
 
         # values of the specific agent
@@ -149,144 +137,93 @@ class LfdAgent(Agent):
 
         self.model.train()
         self.target.eval()
-        results = {'loss': [], 'epoch': [], 'n': []}
+        results = {'loss': [], 'n': []}
 
-        epoch = 0
-        n = 0
+        for n, sample in tqdm(enumerate(self.train_loader)):
 
-        while True:
-            for sample in tqdm(self.train_loader):
+            s = Variable(sample['s'].cuda(), requires_grad=False)
+            s_tag = Variable(sample['s_tag'].cuda(), requires_grad=False)
+            a = Variable(sample['a'].cuda().unsqueeze(1), requires_grad=False)
+            r = Variable(sample['r'].float().cuda(), requires_grad=False)
+            t = Variable(sample['t'].float().cuda(), requires_grad=False)
 
-                s = Variable(sample['s'].cuda(), requires_grad=False)
-                s_tag = Variable(sample['s_tag'].cuda(), requires_grad=False)
-                a = Variable(sample['a'].cuda().unsqueeze(1), requires_grad=False)
-                r = Variable(sample['r'].float().cuda(), requires_grad=False)
-                t = Variable(sample['t'].float().cuda(), requires_grad=False)
+            q = self.model(s)
+            q_a = q.gather(1, a)[:, 0]
 
-                q = self.model(s)
-                q_a = q.gather(1, a)[:, 0]
+            q_target = self.target(s_tag)
+            max_q_target = Variable(q_target.max(1)[0].data, requires_grad=False)
 
-                q_target = self.target(s_tag)
-                max_q_target = Variable(q_target.max(1)[0].data, requires_grad=False)
+            loss = self.loss_fn(q_a, r + args.discount * (max_q_target * (1 - t)))
 
-                loss = self.loss_fn(q_a, r + args.discount * (max_q_target * (1 - t)))
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
 
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
+            # add results
+            results['loss'].append(loss.data.cpu().numpy()[0])
+            results['n'].append(n)
 
-                # add results
-                results['loss'].append(loss.data.cpu().numpy()[0])
-                results['epoch'].append(epoch)
-                results['n'].append(n)
+            if n % args.update_interval == 0:
+                self.update_target()
 
-                if n % args.update_interval == 0:
-                    self.update_target()
-
-                if not (n+1) % n_interval:
-                    yield results
-                    self.model.train()
-                    self.target.eval()
-                    results = {'loss': [], 'epoch': [], 'n': []}
-
-                n += 1
-                if n == n_tot:
-                    return
-
-            epoch += 1
+            if not (n+1) % n_interval:
+                yield results
+                self.model.train()
+                self.target.eval()
+                results = {'loss': [], 'epoch': [], 'n': []}
 
     def evaluate(self, n_interval, n_tot):
 
         self.model.eval()
         self.target.eval()
 
-        results = {'loss': [], 'epoch': [], 'n': []}
-        epoch = 0
-        n = 0
+        results = {'loss': [], 'n': []}
 
-        while True:
-            for sample in self.test_loader:
+        for n, sample in enumerate(self.test_loader):
 
-                s = Variable(sample['s'].cuda(), requires_grad=False)
-                s_tag = Variable(sample['s_tag'].cuda(), requires_grad=False)
-                a = Variable(sample['a'].cuda().unsqueeze(1), requires_grad=False)
-                r = Variable(sample['r'].float().cuda(), requires_grad=False)
-                t = Variable(sample['t'].float().cuda(), requires_grad=False)
+            s = Variable(sample['s'].cuda(), requires_grad=False)
+            s_tag = Variable(sample['s_tag'].cuda(), requires_grad=False)
+            a = Variable(sample['a'].cuda().unsqueeze(1), requires_grad=False)
+            r = Variable(sample['r'].float().cuda(), requires_grad=False)
+            t = Variable(sample['t'].float().cuda(), requires_grad=False)
 
-                q = self.model(s)
-                q_a = q.gather(1, a)[:, 0]
+            q = self.model(s)
+            q_a = q.gather(1, a)[:, 0]
 
-                q_target = self.target(s_tag)
-                max_q_target = Variable(q_target.max(1)[0].data, requires_grad=False)
+            q_target = self.target(s_tag)
+            max_q_target = Variable(q_target.max(1)[0].data, requires_grad=False)
 
-                loss = self.loss_fn(q_a, r + args.discount * (max_q_target * (1 - t)))
+            loss = self.loss_fn(q_a, r + args.discount * (max_q_target * (1 - t)))
 
-                # add results
-                results['loss'].append(loss.data.cpu().numpy()[0])
-                results['epoch'].append(epoch)
-                results['n'].append(n)
+            # add results
+            results['loss'].append(loss.data.cpu().numpy()[0])
+            results['n'].append(n)
 
-                if not (n+1) % n_interval:
-                    results['s'] = s.data.cpu()
-                    results['s_tag'] = s_tag.data.cpu()
-                    results['q'] = q.data.cpu()
-                    results['r'] = r.data.cpu()
-                    yield results
-                    self.model.eval()
-                    self.target.eval()
-                    results = {'loss': [], 'epoch': [], 'n': []}
-
-                n += 1
-                if n == n_tot:
-                    return
-
-            epoch += 1
-
-    # def play(self, n_interval, n_tot):
-    #
-    #     self.model.eval()
-    #     results = {'scores': [], 'epoch': []}
-    #     env = Env()
-    #
-    #     for epoch in tqdm(range(n_tot)):
-    #         env.reset()
-    #         while not env.t:
-    #
-    #             if args.cuda:
-    #                 s = Variable(env.s.cuda(), requires_grad=False)
-    #             else:
-    #                 s = Variable(env.s, requires_grad=False)
-    #
-    #             a = self.model(s)
-    #             a = a.data.cpu().numpy()
-    #             a = np.argmax(a)
-    #             env.step(a)
-    #             # should add a memory functionality
-    #
-    #         results['scores'].append(env.score)
-    #         results['epoch'].append(epoch)
-    #
-    #         if not (epoch+1) % n_interval:
-    #             yield results
-    #             self.model.eval()
-    #             results = {'scores': [], 'epoch': []}
-    #
-    #     env.close()
+            if not (n+1) % n_interval:
+                results['s'] = s.data.cpu()
+                results['s_tag'] = s_tag.data.cpu()
+                results['q'] = q.data.cpu()
+                results['r'] = r.data.cpu()
+                yield results
+                self.model.eval()
+                self.target.eval()
+                results = {'loss': [], 'epoch': [], 'n': []}
 
 
     def play(self, n_interval, n_tot):
 
-        queue = mp.Queue()
+        ctx = mp.get_context('forkserver')
+        queue = ctx.Queue()
         envs = [Env() for i in range(args.gpu_workers)]
         # new = mp.Event()
-        jobs = mp.Queue(n_interval)
-        done = mp.Event()
+        jobs = ctx.Queue(n_interval)
+        done = ctx.Event()
 
         # self.modelcpu.share_memory()
 
         processes = []
         for rank in range(args.gpu_workers):
-            p = mp.Process(target=player, args=(envs[rank], queue, jobs, done, rank))
+            p = ctx.Process(target=player, args=(envs[rank], queue, jobs, done, rank))
             p.start()
             processes.append(p)
 
@@ -310,6 +247,26 @@ class LfdAgent(Agent):
         done.set()
         for p in processes:
             p.join()
+
+
+
+
+    # # A working example for new process for each iteration
+    # def player(env,  model, queue):
+    #
+    #     print("I am Here")
+    #
+    #     env.reset()
+    #     while not env.t:
+    #
+    #         s = Variable(env.s, requires_grad=False)
+    #
+    #         a = model(s)
+    #         a = a.data.cpu().numpy()
+    #         a = np.argmax(a)
+    #         env.step(a)
+    #
+    #     queue.put(env.score)
 
     # # A working example for new process for each iteration pretty slow
     # def play(self, n_interval, n_tot):

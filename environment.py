@@ -24,22 +24,10 @@ class Env(object):
         name = consts.action_meanings[a]
         return self.meanings.index(name)
 
-        # name = consts.action_meanings[a]
-        # if name in self.meanings:
-        #     return self.meanings.index(name)
-        # else:
-        #     return consts.nop
 
     def to_buffer(self, o):
         self.buffer.pop()
         self.buffer.insert(0, o)
-
-    # def preprocess_screen(self, o):
-    #
-    #     img = color.rgb2gray(o)
-    #     # img = transform.resize(img, [args.height, args.width], mode='constant')
-    #     img = cv2.resize(img, (args.height, args.width)) - 0.25
-    #     return img.astype(np.float32)
 
     def to_tensor(self):
         state = np.stack(self.buffer, axis=0)
@@ -64,10 +52,6 @@ class Env(object):
         action = self.get_action(action)
         # print("Action chosen: %s" % self.meanings[action])
         # open ai-gym skips without asking
-        # for j in range(args.skip):
-        #     self.o, r, self.t, self.info = self.env.step(action)
-        #     self.i += 1
-        #     self.r += r
 
         self.o, self.r, self.t, self.info = self.env.step(action)
         self.score += self.r
