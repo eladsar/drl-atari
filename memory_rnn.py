@@ -11,10 +11,6 @@ from config import consts, args
 from preprocess import preprocess_screen
 
 
-# dataset v1 pattern
-# pattern = "{:d},{:d},{:d},{:yesno},{:d}"
-# pattern_dict = dict(yesno=lambda x: x is 'True')
-
 def preprocess_demonstrations():
     if os.path.isdir(os.path.join(args.indir, 'data')):
         if os.path.isfile(
@@ -149,25 +145,13 @@ def divide_dataset(meta):
     return meta
 
 
-class Memory(torch.utils.data.Dataset):
-
-    def __init__(self):
-        super(Memory, self).__init__()
-
-    def __len__(self):
-        return args.n_tot
-
-    def __getitem__(self, index):
-        raise NotImplementedError
-
-
 def init_demonstration_memory(cls):
     cls.update_n_step(0)
     return cls
 
 
 @init_demonstration_memory
-class DemonstrationMemory(Memory):
+class DemonstrationRNNMemory(torch.utils.data.Dataset):
 
     update_interval = args.update_n_steps_interval
     n_steps = args.n_steps
@@ -176,7 +160,7 @@ class DemonstrationMemory(Memory):
     # bootstrap = args.bootstrap
 
     def __init__(self, name, meta, data):
-        super(DemonstrationMemory, self).__init__()
+        super(torch.utils.data.Dataset, self).__init__()
 
         self.meta = meta
         self.data = data
@@ -200,20 +184,17 @@ class DemonstrationMemory(Memory):
         self.action_space = consts.action_space
         self.excitation_map = consts.excitation_map
         self.mask = np.array(consts.excitation_mask[args.game], dtype=np.float32)
-        self.hot = args.hot
 
         self.one = np.ones(1, dtype=np.int)[0]
 
         # set action management according to configuration
         if args.input_actions:
-            if self.hot:
-                self.get_action = self.get_hot_action
-                self.hotvec_matrix = np.array(consts.hotvec_matrix, dtype=np.float32)
-            else:
-                self.get_action = self.get_action_excitation
-
+            self.get_action = self.get_action_excitation
         else:
             self.get_action = self.get_action_index
+
+    def __len__(self):
+        return len(self.data)
 
     @classmethod
     def update_n_step(cls, i):
@@ -238,14 +219,6 @@ class DemonstrationMemory(Memory):
         self.probabilities[self.td_error == 0] = m
         self.probabilities = self.probabilities / self.probabilities.sum()
 
-    def get_hot_action(self, a):
-        m = np.zeros((self.action_space, self.skip))
-        m[a, range(self.skip)] = 1
-        m = m.sum(1)
-        a = (1 + np.argmax(m[1:])) * (a.sum() != 0)
-        a_vec = self.hotvec_matrix[a]
-        return a_vec, a
-
     def get_action_excitation(self, a):
         m = np.zeros((self.action_space, self.skip))
         m[a, range(self.skip)] = 1
@@ -265,111 +238,38 @@ class DemonstrationMemory(Memory):
 
     def __getitem__(self, index):
 
-        epoch, frame, local, terminal = self.meta['flat'][index]
+        epoch = index
+
         trajectory = self.data[str(epoch)]
+        n = len(trajectory)
 
-        # k steps forward
-        k = min(self.n_steps, self.meta[str(epoch)] - local - 2)
+        frame0 = [os.path.join(self.meta['screens_dir'], str(epoch), "%d.png" % (i * self.skip)) for i in range(n-1)]
+        frame1 = [os.path.join(self.meta['screens_dir'], str(epoch), "%d.png" % (1 + i * self.skip)) for i in range(n-1)]
+        imgs = [preprocess_screen((f0, f1)) for f0, f1 in zip(frame0, frame1)]
 
-        # get current state parameters
-        s = self.preprocess_history(epoch, frame)
+        o = [np.stack(imgs[i: i - self.history_length: -1], axis=0).expand_dims(axis=0) for i in range(self.history_length-1, n-1)]
+        o = np.concatenate(o)
 
-        # get the most frequent action. Action NOOP is chosen only if all the series is NOOP
-        actions = trajectory[local+1, self.meta['action']:self.meta['action'] + self.skip]
-        a, a_index = self.get_action(actions)
-
-        # get next state parameters
-        s_tag = self.preprocess_history(epoch, frame + k)
-
-        actions = trajectory[local+1 + k, self.meta['action']:self.meta['action'] + self.skip]
-        a_tag, a_tag_index = self.get_action(actions)
-
-        # is next state a terminal
-        # t = self.one if (self.myopic or not DemonstrationMemory.bootstrap) else trajectory[local + k, self.meta['terminal']]
-        t = self.one if self.myopic else trajectory[local+1 + k, self.meta['terminal']]
+        a = [self.get_action(actions)[0] for actions in trajectory[self.history_length-1: n-1, self.meta['action']:self.meta['action'] + self.skip]]
 
         # get trajectory reward
-        score_pre = trajectory[local:(local + k), self.meta['score']]
-        score_post = trajectory[(local + 1):(local + k + 1), self.meta['score']]
+        score_pre = trajectory[self.history_length-1: n-1, self.meta['score']]
+        score_post = trajectory[self.history_length, n, self.meta['score']]
         rewards = score_post - score_pre
 
         rewards = np.clip(rewards, -self.clip, self.clip)
+        r = (rewards / self.meta['avg_score']).astype(np.float32)
 
-        discounts = self.discount ** np.arange(k)
-        r = np.multiply(rewards, discounts).sum()
+        # get final score discounted from each observation
 
-        r = r / self.meta['avg_score']
-
-        # get final and baseline score
-        # f = trajectory[-1, self.meta['score']] / self.meta['avg_score']
-        # base = trajectory[local, self.meta['score']] / self.meta['avg_score']
-
-        score_pre = trajectory[local:-1, self.meta['score']]
-        score_post = trajectory[(local + 1):, self.meta['score']]
-        rewards = score_post - score_pre
-
-        # try to add penalty for terminal state
-        # if t:
-        #     rewards[-1] -= self.meta['avg_score'] / 2
-
-        discounts = self.discount ** np.arange(len(rewards))
-        f = np.multiply(rewards, discounts).sum()
+        f = [np.multiply(rewards[i:], self.discount ** np.arange(len(rewards[i:]))).sum() for i in range(n-self.history_length)]
+        f = np.concatenate(f)
         f = f / self.meta['avg_score']
 
-        score = (trajectory[-1, self.meta['score']] - trajectory[local, self.meta['score']]).astype(np.float32) / self.meta['avg_score']
-
-        is_final = int(local == (self.meta[str(epoch)] - 3))
-
-        return {'s': s, 'a': a, 'a_tag': a_tag, 'r': r.astype(np.float32),
-                's_tag': s_tag, 't': t.astype(np.float32),
-                'k': np.array([k], dtype=np.float32), 'i': index, 'f': f.astype(np.float32),
-                'is_final': is_final, 'a_index': a_index, 'score': score.astype(np.float32)}
-
-    def preprocess_history(self, epoch, frame):
-        frame0 = [os.path.join(self.meta['screens_dir'], str(epoch), "%d.png" % (frame - i * self.skip)) for i in range(self.history_length)]
-        frame1 = [os.path.join(self.meta['screens_dir'], str(epoch), "%d.png" % (frame + 1 - i * self.skip)) for i in range(self.history_length)]
-
-        imgs = [preprocess_screen((f0, f1)) for f0, f1 in zip(frame0, frame1)]
-        # try:
-        #
-        # except:
-        #     print("XXX")
-        return np.stack(imgs, axis=0)
+        return {'o': o, 'a': a, 'r': r.astype(np.float32), 'f': f.astype(np.float32)}
 
 
-# change behavior in the test dataset case: no prioritized replay, n_steps should follow the train dataset
-class DemonstrationBatchSampler(object):
-
-    def __init__(self, dataset, train=True):
-        self.dataset = dataset
-        self.train = train
-        self.batch = args.batch
-        self.update_memory_interval = args.update_memory_interval
-        self.prioritized_replay = args.prioritized_replay
-
-    def __iter__(self):
-
-        n = self.dataset.n
-        n_batches = int(n / self.batch)
-        shuffle_batch = np.copy(self.dataset.indices)
-
-        if not self.prioritized_replay or not self.train:
-            for i in range(len(self)):
-                if not i % n_batches:
-                    np.random.shuffle(shuffle_batch)
-                    indices = shuffle_batch[:n_batches * self.batch].reshape((self.batch, n_batches))
-                yield indices[:, i % n_batches]
-        else:
-            for i in range(len(self)):
-                if not i % self.update_memory_interval:
-                    indices = np.random.choice(self.dataset.indices, size=(self.batch, self.update_memory_interval),
-                                               p=self.dataset.probabilities)
-                yield indices[:, i % self.update_memory_interval]
-
-    def __len__(self):
-        return int(len(self.dataset) / self.batch)
-
-class SequentialDemonstrationSampler(torch.utils.data.sampler.Sampler):
+class SequentialDemonstrationRNNSampler(torch.utils.data.sampler.Sampler):
     """Samples elements sequentially, always in the same order.
 
     Arguments:
@@ -381,18 +281,8 @@ class SequentialDemonstrationSampler(torch.utils.data.sampler.Sampler):
 
     def __iter__(self):
 
-        n_iteration = len(self.data_source.indices)
-        for i in range(len(self)):
-            yield self.data_source.indices[i % n_iteration]
+        for epoch in self.data_source.data:
+            yield int(epoch)
 
     def __len__(self):
         return len(self.data_source)
-
-# previous implementations:
-
-        # get action:
-        # vals, counts = np.unique(np.extract(actions > 0, actions), return_counts=True)
-        # a_tag = actions[0] if not actions.max() else vals[np.argmax(counts)]
-
-    # no gamma discount factor
-    # r = trajectory[local + k, self.meta['score']] - trajectory[local, self.meta['score']]
