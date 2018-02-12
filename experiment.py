@@ -20,28 +20,33 @@ from agent import LfdAgent
 from test_agent import TestAgent
 from behavioral_agent import BehavioralAgent
 from behavioral_hot_agent import BehavioralHotAgent
-
+from behavioral_dist_agent import BehavioralDistAgent
+from cdqn_horizon_agent import ACDQNLSTMAgent
+from acdqn_agent import ACDQNAgent
+# from detached_agent import DetachedAgent
+from partially_detached_agent import DetachedAgent
 from logger import logger
 from preprocess import convert_screen_to_rgb
-
+from distutils.dir_util import copy_tree
 
 
 class Experiment(object):
 
-    def __init__(self):
+    def __init__(self, load_exp=None):
 
         # parameters
-        self.input_actions = args.input_actions
+        self.input_actions = True
+
         if self.input_actions:
             self.action_space = consts.action_space
         else:
             self.action_space = consts.n_actions[args.game]
 
         self.action_meanings = consts.action_meanings
-        self.activation2action = consts.activation2action[args.game]
         self.one_hots = torch.sparse.torch.eye(self.action_space)
         self.batch = args.batch
         self.l1_loss = args.l1_loss
+        self.detached_agent = args.detached_agent
 
         dirs = os.listdir(args.outdir)
 
@@ -50,29 +55,33 @@ class Experiment(object):
             self.comet.log_multiple_params(vars(args))
 
         self.load_model = args.load_last_model or args.load_best_model
-        self.load_last = args.load_last_model
         self.load_best = args.load_best_model
+        self.load_last = args.load_last_model
+
+        if load_exp is not None:
+            self.load_last = True
+            self.resume = load_exp
+        else:
+            self.resume = args.resume
 
         self.exp_name = ""
         if self.load_model:
-            if args.resume >= 0:
+            if self.resume >= 0:
                 for d in dirs:
-                    if "%s_exp_%04d_" % (args.identifier, args.resume) in d:
+                    if "%s_exp_%04d_" % (args.identifier, self.resume) in d:
                         self.exp_name = d
+                        self.exp_num = self.resume
                         break
             else:
-                max = 0
-                for d in dirs:
-                    n = int(d.split("_")[2])
-                    if n > max:
-                        self.exp_name = d
-                        break
+                raise Exception("Non-existing experiment")
 
         if not self.exp_name:
             # count similar experiments
             n = sum([1 for d in dirs if "%s_exp" % args.identifier in d])
             self.exp_name = "%s_exp_%04d_%s" % (args.identifier, n, consts.exptime)
             self.load_model = False
+
+            self.exp_num = n
 
         # init experiment parameters
         self.root = os.path.join(args.outdir, self.exp_name)
@@ -81,6 +90,8 @@ class Experiment(object):
         self.tensorboard_dir = os.path.join(self.root, 'tensorboard')
         self.checkpoints_dir = os.path.join(self.root, 'checkpoints')
         self.results_dir = os.path.join(self.root, 'results')
+        self.scores_dir = os.path.join(self.root, 'scores')
+        self.code_dir = os.path.join(self.root, 'code')
 
         self.checkpoint = os.path.join(self.checkpoints_dir, 'checkpoint')
         self.checkpoint_best = os.path.join(self.checkpoints_dir, 'checkpoint_best')
@@ -93,18 +104,25 @@ class Experiment(object):
             os.makedirs(self.tensorboard_dir)
             os.makedirs(self.checkpoints_dir)
             os.makedirs(self.results_dir)
+            os.makedirs(self.scores_dir)
+            os.makedirs(self.code_dir)
+
+            # copy code to dir
+            copy_tree(os.path.abspath("."), self.code_dir)
+
+            # write csv file of hyper-parameters
+            filename = os.path.join(self.root, "hyperparameters.csv")
+            with open(filename, 'w', newline='') as csvfile:
+                spamwriter = csv.writer(csvfile, delimiter=',',
+                                        quotechar='|', quoting=csv.QUOTE_MINIMAL)
+                spamwriter.writerow(self.exp_name)
+                for k, v in vars(args).items():
+                    spamwriter.writerow([k, str(v)])
 
         # initialize tensorboard writer
         if args.tensorboard:
             self.writer = SummaryWriter(log_dir=self.tensorboard_dir, comment=args.identifier)
-        # write csv file of hyper-parameters
-        filename = os.path.join(self.root, "hyperparameters.csv")
-        with open(filename, 'w', newline='') as csvfile:
-            spamwriter = csv.writer(csvfile, delimiter=',',
-                                    quotechar='|', quoting=csv.QUOTE_MINIMAL)
-            spamwriter.writerow(self.exp_name)
-            for k, v in vars(args).items():
-                spamwriter.writerow([k, str(v)])
+
 
     def __enter__(self):
         return self
@@ -114,7 +132,360 @@ class Experiment(object):
             self.writer.export_scalars_to_json(os.path.join(self.tensorboard_dir, "all_scalars.json"))
             self.writer.close()
 
+    def visualize(self, model_name):
+        agent = self.choose_agent()
+        model = getattr(agent, model_name)
+        conv1 = model.cnn_conv1[0].weight.data.cpu().numpy()
+        n, c, x, y = conv1.shape
+        conv1_bw = conv1.transpose(0, 2, 1, 3).reshape(n * x, c * y)
+
+        conv1_3d = conv1[:, :3, :, :]
+        conv1_3d = np.expand_dims(conv1_3d, axis=0)
+        conv1_3d = conv1_3d.reshape(8, 4, 3, 8, 8)
+        conv1_3d = conv1_3d.transpose(0, 3, 1, 4, 2)
+        conv1_3d = conv1_3d.reshape(64, 32, 3)
+
+        return {'conv1_bw': conv1_bw,
+                'conv1_3d': conv1_3d,
+                'conv1': conv1
+        }
+
     def behavioral(self):
+
+        if args.distributional:
+            return self.behavioral_distributional()
+        elif args.actor_critic:
+            return self.behavioral_ac()
+        else:
+            return self.behavioral_hot()
+
+    def behavioral_ac(self):
+
+        # init time variables
+        t_start = time.time()
+
+        if args.detached_agent:
+            agent = DetachedAgent()
+
+        elif not args.recurrent:
+            agent = ACDQNAgent()
+        else:
+            agent = ACDQNLSTMAgent()
+
+        # load model
+        if self.load_model:
+            if self.load_last:
+                aux = agent.resume(self.checkpoint)
+            elif self.load_best:
+                aux = agent.resume(self.checkpoint_best)
+            n_offset = aux['n']
+            # n_offset = 61
+        else:
+            n_offset = 0
+
+            # save a random init checkpoint
+            agent.save_checkpoint(self.checkpoint, {'n': 0})
+
+        best = np.inf
+
+        # define experiment generators
+        test = agent.test(args.evaluate_frames, args.n_tot)
+        learn = agent.learn(args.checkpoint_interval, args.n_tot)
+
+        human_score = agent.train_dataset.meta['avg_score']
+
+        test_results = next(test)
+
+        init_test_loss = np.mean(test_results['loss_beta'])
+
+        t_last = time.time()
+
+        logger.info("Begin Behavioral Distributional learning experiment")
+        logger.info("Game: %s | human score %g | initial loss %g" %
+                    (args.game, human_score, init_test_loss))
+
+        for n, train_results in enumerate(learn):
+
+            t_train = time.time() - t_last
+            test_results = next(test)
+            t_eval = time.time() - t_train - t_last
+
+            simulation_time = time.time() - t_start
+
+            avg_train_loss_beta = np.mean(train_results['loss_beta'])
+            avg_test_loss_beta = np.mean(test_results['loss_beta'])
+
+            avg_train_loss_v_beta = np.mean(train_results['loss_v_beta'])
+            avg_test_loss_v_beta = np.mean(test_results['loss_v_beta'])
+
+            avg_train_loss_q_beta = np.mean(train_results['loss_q_beta'])
+            avg_test_loss_q_beta = np.mean(test_results['loss_q_beta'])
+
+            avg_train_loss_q_pi = np.mean(train_results['loss_q_pi'])
+            avg_test_loss_q_pi = np.mean(test_results['loss_q_pi'])
+
+            avg_train_loss_v_pi = np.mean(train_results['loss_v_pi'])
+            avg_test_loss_v_pi = np.mean(test_results['loss_v_pi'])
+
+            avg_train_loss_pi = np.mean(train_results['loss_pi'])
+            avg_test_loss_pi = np.mean(test_results['loss_pi'])
+
+            avg_act_diff = np.mean(test_results['act_diff'])
+
+            # log to tensorboard
+            if args.tensorboard:
+                self.writer.add_scalar('train_loss/loss_beta', float(avg_train_loss_beta), n + n_offset)
+                self.writer.add_scalar('test_loss/loss_beta', float(avg_test_loss_beta), n + n_offset)
+
+                self.writer.add_scalar('train_loss/loss_q_beta', float(avg_train_loss_q_beta), n + n_offset)
+                self.writer.add_scalar('test_loss/loss_q_beta', float(avg_test_loss_q_beta), n + n_offset)
+
+                self.writer.add_scalar('train_loss/loss_v_beta', float(avg_train_loss_v_beta), n + n_offset)
+                self.writer.add_scalar('test_loss/loss_v_beta', float(avg_test_loss_v_beta), n + n_offset)
+
+                self.writer.add_scalar('train_loss/loss_v_pi', float(avg_train_loss_v_pi), n + n_offset)
+                self.writer.add_scalar('test_loss/loss_v_pi', float(avg_test_loss_v_pi), n + n_offset)
+
+                self.writer.add_scalar('train_loss/loss_q_pi', float(avg_train_loss_q_pi), n + n_offset)
+                self.writer.add_scalar('test_loss/loss_q_pi', float(avg_test_loss_q_pi), n + n_offset)
+
+                self.writer.add_scalar('train_loss/loss_pi', float(avg_train_loss_pi), n + n_offset)
+                self.writer.add_scalar('test_loss/loss_pi', float(avg_test_loss_pi), n + n_offset)
+
+                self.writer.add_scalar('actions/act_diff', float(avg_act_diff), n)
+
+                self.writer.add_histogram("actions/agent", test_results['a_agent'], n, 'doane')
+                self.writer.add_histogram("actions/a_player", test_results['a_player'], n, 'doane')
+
+                if not self.detached_agent:
+                    for name, param in agent.model.named_parameters():
+                        self.writer.add_histogram("model/%s" % name, param.clone().cpu().data.numpy(), n + n_offset, 'fd')
+                else:
+                    for name, param in agent.beta_net.named_parameters():
+                        self.writer.add_histogram("beta_net/%s" % name, param.clone().cpu().data.numpy(), n + n_offset, 'fd')
+                    for name, param in agent.pi_net.named_parameters():
+                        self.writer.add_histogram("pi_net/%s" % name, param.clone().cpu().data.numpy(), n + n_offset, 'fd')
+                    for name, param in agent.q_net.named_parameters():
+                        self.writer.add_histogram("q_net/%s" % name, param.clone().cpu().data.numpy(), n + n_offset, 'fd')
+                    # for name, param in agent.vb_net.named_parameters():
+                    #     self.writer.add_histogram("vb_net/%s" % name, param.clone().cpu().data.numpy(), n + n_offset, 'fd')
+
+            # save agent state
+            agent.save_checkpoint(self.checkpoint, {'n': n + 1})
+
+            if abs(avg_train_loss_beta) < best:
+                best = abs(avg_train_loss_beta)
+                agent.save_checkpoint(self.checkpoint_best, {'n': n + 1})
+
+            # init interval timer
+            t_interval = time.time() - t_last
+            t_last = time.time()
+
+            img = test_results['s'][0, :-1, :, :]
+
+            self.writer.add_image('states/state', img, n)
+
+            if not self.detached_agent:
+                logger.info(" ")
+                #  log to screen and logger
+                logger.info("------------Checkpoint @ Behavioral Experiment: %s------------" % self.exp_name)
+                logger.info(
+                    "Evaluation @ n=%d, step=%d | Test Qpi Loss: %g | Train Vpi Loss: %g | Train pi Loss: %g | Train beta Loss: %g"
+                    % (n + n_offset, train_results['n'][-1], avg_test_loss_q_pi, avg_test_loss_v_pi, avg_test_loss_pi,
+                       avg_test_loss_beta))
+                logger.info("Total Simulation time: %g| Interval time: %g| Train: %g |  Test: %g"
+                            % (simulation_time, t_interval, t_train, t_eval))
+
+                logger.info(" ")
+                logger.info("Layers statistics:")
+                for name, module in list(agent.model.named_modules()):
+
+                    if not hasattr(module, 'weight'):
+                        continue
+                    logger.info(" ")
+                    logger.info("%s:" % name)
+                    logger.info("weights norm: %s" % str(module.weight.data.norm()))
+
+                    if module.weight.grad is not None:
+                        logger.info("weights-grad norm: %s" % str(module.weight.grad.data.norm()))
+
+                    if not hasattr(module, 'bias'):
+                        continue
+
+                    logger.info("bias norm: %s" % str(module.bias.data.norm()))
+
+                    if module.bias.grad is not None:
+                        logger.info("bias-grad norm: %s" % str(module.bias.grad.data.norm()))
+
+            if not args.recurrent:
+                self.print_actions_statistics(test_results['a_agent'], test_results['a_player'], n)
+
+        return agent
+
+
+    def behavioral_distributional(self):
+
+        # init time variables
+        t_start = time.time()
+
+        agent = BehavioralDistAgent()
+
+        # load model
+        if self.load_model:
+            if self.load_last:
+                aux = agent.resume(self.checkpoint)
+            elif self.load_best:
+                aux = agent.resume(self.checkpoint_best)
+            n_offset = aux['n']
+            # n_offset = 61
+        else:
+            n_offset = 0
+
+        best = np.inf
+
+        # define experiment generators
+        test = agent.test(args.evaluate_frames, args.n_tot)
+        learn = agent.learn(args.checkpoint_interval, args.n_tot)
+
+        human_score = agent.train_dataset.meta['avg_score']
+
+        test_results = next(test)
+
+        init_test_loss = np.mean(test_results['loss_vs'])
+
+        t_last = time.time()
+
+        logger.info("Begin Behavioral Distributional learning experiment")
+        logger.info("Game: %s | human score %g | initial loss %g" %
+                    (args.game, human_score, init_test_loss))
+
+        for n, train_results in enumerate(learn):
+
+            t_train = time.time() - t_last
+            test_results = next(test)
+            t_eval = time.time() - t_train - t_last
+
+            simulation_time = time.time() - t_start
+
+            avg_train_loss_qs = np.mean(train_results['loss_qs'])
+            avg_test_loss_qs = np.mean(test_results['loss_qs'])
+
+            avg_train_loss_vs = np.mean(train_results['loss_vs'])
+            avg_test_loss_vs = np.mean(test_results['loss_vs'])
+
+            avg_train_loss_b = np.mean(train_results['loss_b'])
+            avg_test_loss_b = np.mean(test_results['loss_b'])
+
+            avg_train_loss_vl = np.mean(train_results['loss_vl'])
+            avg_test_loss_vl = np.mean(test_results['loss_vl'])
+
+            avg_train_loss_ql = np.mean(train_results['loss_ql'])
+            avg_test_loss_ql = np.mean(test_results['loss_ql'])
+
+            avg_train_loss_pi_s = np.mean(train_results['loss_pi_s'])
+            avg_test_loss_pi_s = np.mean(test_results['loss_pi_s'])
+
+            avg_train_loss_pi_l = np.mean(train_results['loss_pi_l'])
+            avg_test_loss_pi_l = np.mean(test_results['loss_pi_l'])
+
+            avg_train_loss_pi_s_tau = np.mean(train_results['loss_pi_s_tau'])
+            avg_test_loss_pi_s_tau = np.mean(test_results['loss_pi_s_tau'])
+
+            avg_train_loss_pi_l_tau = np.mean(train_results['loss_pi_l_tau'])
+            avg_test_loss_pi_l_tau = np.mean(test_results['loss_pi_l_tau'])
+
+            avg_act_diff = np.mean(test_results['act_diff'])
+
+            # log to tensorboard
+            if args.tensorboard:
+                self.writer.add_scalar('train_loss/loss_qs', float(avg_train_loss_qs), n + n_offset)
+                self.writer.add_scalar('test_loss/loss_qs', float(avg_test_loss_qs), n + n_offset)
+
+                self.writer.add_scalar('train_loss/loss_vs', float(avg_train_loss_vs), n + n_offset)
+                self.writer.add_scalar('test_loss/loss_vs', float(avg_test_loss_vs), n + n_offset)
+
+                self.writer.add_scalar('train_loss/loss_b', float(avg_train_loss_b), n + n_offset)
+                self.writer.add_scalar('test_loss/loss_b', float(avg_test_loss_b), n + n_offset)
+
+                self.writer.add_scalar('train_loss/loss_ql', float(avg_train_loss_ql), n + n_offset)
+                self.writer.add_scalar('test_loss/loss_ql', float(avg_test_loss_ql), n + n_offset)
+
+                self.writer.add_scalar('train_loss/loss_vl', float(avg_train_loss_vl), n + n_offset)
+                self.writer.add_scalar('test_loss/loss_vl', float(avg_test_loss_vl), n + n_offset)
+
+                self.writer.add_scalar('train_loss/loss_pi_s', float(avg_train_loss_pi_s), n + n_offset)
+                self.writer.add_scalar('test_loss/loss_pi_s', float(avg_test_loss_pi_s), n + n_offset)
+
+                self.writer.add_scalar('train_loss/loss_pi_l', float(avg_train_loss_pi_l), n + n_offset)
+                self.writer.add_scalar('test_loss/loss_pi_l', float(avg_test_loss_pi_l), n + n_offset)
+
+                self.writer.add_scalar('train_loss/loss_pi_s_tau', float(avg_train_loss_pi_s_tau), n + n_offset)
+                self.writer.add_scalar('test_loss/loss_pi_s_tau', float(avg_test_loss_pi_s_tau), n + n_offset)
+
+                self.writer.add_scalar('train_loss/loss_pi_l_tau', float(avg_train_loss_pi_l_tau), n + n_offset)
+                self.writer.add_scalar('test_loss/loss_pi_l_tau', float(avg_test_loss_pi_l_tau), n + n_offset)
+
+                self.writer.add_scalar('actions/act_diff', float(avg_act_diff), n)
+
+                self.writer.add_histogram("actions/agent", test_results['a_agent'], n, 'doane')
+                self.writer.add_histogram("actions/a_player", test_results['a_player'], n, 'doane')
+
+
+                for name, param in agent.model.named_parameters():
+                    self.writer.add_histogram("model/%s" % name, param.clone().cpu().data.numpy(), n + n_offset, 'fd')
+
+            # save agent state
+            agent.save_checkpoint(self.checkpoint, {'n': n + 1})
+
+            if abs(avg_test_loss_vs) < best:
+                best = abs(avg_test_loss_vs)
+                agent.save_checkpoint(self.checkpoint_best, {'n': n + 1})
+
+            # init interval timer
+            t_interval = time.time() - t_last
+            t_last = time.time()
+
+            img = test_results['s'][0, :-1, :, :]
+
+            self.writer.add_image('states/state', img, n)
+
+            logger.info(" ")
+            #  log to screen and logger
+            logger.info("------------Checkpoint @ Behavioral Experiment: %s------------" % self.exp_name)
+            logger.info(
+                "Evaluation @ n=%d, step=%d | Test Qs Loss: %g | Train Qs Loss: %g | Train Vs Loss: %g | Train beta Loss: %g"
+                % (n + n_offset, train_results['n'][-1], avg_test_loss_qs, avg_train_loss_qs, avg_train_loss_vs,
+                   avg_train_loss_b))
+            logger.info("Total Simulation time: %g| Interval time: %g| Train: %g |  Test: %g"
+                        % (simulation_time, t_interval, t_train, t_eval))
+
+            logger.info(" ")
+            logger.info("Layers statistics:")
+            for name, module in list(agent.model.named_modules()):
+
+                if not hasattr(module, 'weight'):
+                    continue
+                logger.info(" ")
+                logger.info("%s:" % name)
+                logger.info("weights norm: %s" % str(module.weight.data.norm()))
+
+                if module.weight.grad is not None:
+                    logger.info("weights-grad norm: %s" % str(module.weight.grad.data.norm()))
+
+                if not hasattr(module, 'bias'):
+                    continue
+
+                logger.info("bias norm: %s" % str(module.bias.data.norm()))
+
+                if module.bias.grad is not None:
+                    logger.info("bias-grad norm: %s" % str(module.bias.grad.data.norm()))
+
+            self.print_actions_statistics(test_results['a_agent'], test_results['a_player'], n)
+
+        return agent.model.state_dict()
+
+    def behavioral_hot(self):
+
         # init time variables
         t_start = time.time()
 
@@ -224,11 +595,11 @@ class Experiment(object):
                     self.writer.add_histogram("model/%s" % name, param.clone().cpu().data.numpy(), n + n_offset, 'fd')
 
             # save agent state
-            agent.save_checkpoint(self.checkpoint, {'n': n+1})
+            agent.save_checkpoint(self.checkpoint, {'n': n + 1})
 
             if abs(avg_test_loss_v) < best:
                 best = abs(avg_test_loss_v)
-                agent.save_checkpoint(self.checkpoint_best, {'n': n+1})
+                agent.save_checkpoint(self.checkpoint_best, {'n': n + 1})
 
             # init interval timer
             t_interval = time.time() - t_last
@@ -241,8 +612,10 @@ class Experiment(object):
             logger.info(" ")
             #  log to screen and logger
             logger.info("------------Checkpoint @ Behavioral Experiment: %s------------" % self.exp_name)
-            logger.info("Evaluation @ n=%d, step=%d | Test Q Loss: %g | Train Q Loss: %g | Train V Loss: %g | Train beta Loss: %g"
-                        % (n + n_offset, train_results['n'][-1], avg_test_loss_q, avg_train_loss_q, avg_train_loss_v, avg_train_loss_b))
+            logger.info(
+                "Evaluation @ n=%d, step=%d | Test Q Loss: %g | Train Q Loss: %g | Train V Loss: %g | Train beta Loss: %g"
+                % (n + n_offset, train_results['n'][-1], avg_test_loss_q, avg_train_loss_q, avg_train_loss_v,
+                   avg_train_loss_b))
             logger.info("Total Simulation time: %g| Interval time: %g| Train: %g |  Test: %g"
                         % (simulation_time, t_interval, t_train, t_eval))
 
@@ -266,8 +639,8 @@ class Experiment(object):
 
                 if module.bias.grad is not None:
                     logger.info("bias-grad norm: %s" % str(module.bias.grad.data.norm()))
-                # except:
-                #     print("XXX")
+                    # except:
+                    #     print("XXX")
 
             self.print_actions_statistics(test_results['a_agent'], test_results['a_player'], n)
 
@@ -336,10 +709,8 @@ class Experiment(object):
 
     def play_behavioral_render(self, params=None):
 
-        if args.hot:
-            agent = BehavioralHotAgent(load_dataset=False)
-        else:
-            agent = BehavioralAgent(load_dataset=False)
+        agent = self.choose_agent()
+
         # load model
         if params is not None:
             agent.resume(params)
@@ -354,12 +725,30 @@ class Experiment(object):
             # print("i=%d" % i)
             yield step
 
+
+    def choose_agent(self):
+
+        if args.detached_agent:
+            agent = DetachedAgent(load_dataset=False)
+
+        elif args.distributional:
+            agent = BehavioralDistAgent(load_dataset=False)
+
+        elif args.actor_critic:
+            agent = ACDQNAgent(load_dataset=False)
+
+        else:
+            if args.hot:
+                agent = BehavioralHotAgent(load_dataset=False)
+            else:
+                agent = BehavioralAgent(load_dataset=False)
+
+        return agent
+
     def play_behavioral(self, params=None):
 
-        if args.hot:
-            agent = BehavioralHotAgent(load_dataset=False)
-        else:
-            agent = BehavioralAgent(load_dataset=False)
+        agent = self.choose_agent()
+
         # load model
         if params is not None:
             agent.resume(params)
@@ -374,6 +763,63 @@ class Experiment(object):
         for i, step in enumerate(player):
             score = step['score']
             print("episode %d | score is %d" % (i, score))
+
+    def play(self, params=None):
+
+        agent = self.choose_agent()
+        n = 0
+
+        while n * args.checkpoint_interval < (args.n_tot - 2 * 4096):
+
+            # load model
+            try:
+                if params is not None:
+                    aux = agent.resume(params)
+                elif self.load_last:
+                    aux = agent.resume(self.checkpoint)
+                elif self.load_best:
+                    aux = agent.resume(self.checkpoint_best)
+                else:
+                    raise NotImplementedError
+            except: # when reading and writing collide
+                time.sleep(2)
+                if params is not None:
+                    aux = agent.resume(params)
+                elif self.load_last:
+                    aux = agent.resume(self.checkpoint)
+                elif self.load_best:
+                    aux = agent.resume(self.checkpoint_best)
+                else:
+                    raise NotImplementedError
+
+            results = {'n': aux['n'], 'beta':{'score':[], 'frames':[]},
+                       'q_b': {'score': [], 'frames': []},
+                       'pi': {'score': [], 'frames': []},
+                       'q_pi': {'score': [], 'frames': []}}
+
+            player_types = ['beta', 'q_b', 'pi', 'q_pi']
+
+            for action_offset in [1, round((args.action_offset + 1) / 2.), args.action_offset]:
+
+                for type in player_types:
+                    player = agent.play(args.test_episodes, action_offset, type)
+                    results[type]['score'].append([])
+                    results[type]['frames'].append([])
+
+                    for i, step in tqdm(enumerate(player)):
+                        results[type]['score'][-1].append(step['score'])
+                        results[type]['frames'][-1].append(step['frames'] * args.skip)
+
+                n = results['n']
+
+                logger.info("Episode %d | action offset %d" % (n, action_offset))
+                for type in player_types:
+                    score = np.array(results[type]['score'][-1])
+                    frames = np.array(results[type]['frames'][-1])
+                    logger.info("Player: %s\t|avg score: %d\t|avg_frames: %d\t|best score: %d\t| worst score: %d\t| " % (type, round(score.mean()), round(frames.mean()), score.max(), score.min()))
+
+            filename = os.path.join(self.scores_dir, "%d" % n)
+            np.savez(filename, results=results)
 
     def lfd(self):
 
@@ -571,10 +1017,7 @@ class Experiment(object):
         # histogram for each action
         for activation in range(self.action_space):
 
-            if not self.input_actions:
-                a = self.activation2action[activation]
-            else:
-                a = activation
+            a = activation
             name = self.action_meanings[a]
             self.writer.add_histogram("actions/q_histogram_%s(%d)" % (name, a), q[:, activation], n, 'fd')
 

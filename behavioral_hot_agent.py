@@ -59,7 +59,12 @@ class BehavioralHotAgent(Agent):
 
         self.loss_fn_r = torch.nn.MSELoss(size_average=True)
         self.loss_fn_p = torch.nn.L1Loss(size_average=True)
-        self.loss_fn_beta = torch.nn.CrossEntropyLoss()
+
+        if self.weight_by_expert:
+            self.loss_fn_beta = torch.nn.CrossEntropyLoss(reduce=False)
+        else:
+            self.loss_fn_beta = torch.nn.CrossEntropyLoss(reduce=True)
+
 
         # alpha weighted sum
 
@@ -67,7 +72,7 @@ class BehavioralHotAgent(Agent):
         self.alpha_b = 1  # 1 / 0.7
 
         self.alpha_r = 1  # 1 / 0.7
-        self.alpha_p = 1  # 1 / 0.7
+        self.alpha_p = 0  # 1 / 0.7
         self.alpha_q = 1
 
         self.model = BehavioralHotNet()
@@ -97,7 +102,7 @@ class BehavioralHotAgent(Agent):
         actions = Variable(actions, requires_grad=False).cuda()
 
         self.actions_matrix = actions.unsqueeze(0)
-        self.reverse_excitation_index = consts.hotvec_inv
+        # self.reverse_excitation_index = consts.hotvec_inv
 
     @staticmethod
     def individual_loss_fn_l2(argument):
@@ -166,14 +171,15 @@ class BehavioralHotAgent(Agent):
 
             s = Variable(sample['s'].cuda(), requires_grad=False)
             s_tag = Variable(sample['s_tag'].cuda(), requires_grad=False)
-            a = Variable(sample['a'].float().cuda(), requires_grad=False)
+            a = Variable(sample['a'].cuda(), requires_grad=False)
             a_tag = Variable(sample['a_tag'].float().cuda(), requires_grad=False)
-            r = Variable(sample['r'].float().cuda().unsqueeze(1), requires_grad=False)
-            t = Variable(sample['t'].float().cuda().unsqueeze(1), requires_grad=False)
-            k = Variable(sample['k'].float().cuda().unsqueeze(1), requires_grad=False)
+            r = Variable(sample['r'].cuda().unsqueeze(1), requires_grad=False)
+            t = Variable(sample['t'].cuda().unsqueeze(1), requires_grad=False)
+            k = Variable(sample['k'].cuda().unsqueeze(1), requires_grad=False)
             a_index = Variable(sample['a_index'].cuda(), requires_grad=False)
-            f = Variable(sample['f'].float().cuda().unsqueeze(1), requires_grad=False)
+            f = Variable(sample['f'].cuda().unsqueeze(1), requires_grad=False)
             score = Variable(sample['score'].cuda(async=True).unsqueeze(1), requires_grad=False)
+            w = Variable(sample['w'].cuda(), requires_grad=False)
 
             indexes = sample['i']
 
@@ -184,13 +190,15 @@ class BehavioralHotAgent(Agent):
             loss_v = self.alpha_v * self.loss_fn_value(value, f + self.final_score_reward * score)
             loss_q = self.alpha_q * self.loss_fn_q(q, f + self.final_score_reward * score)
 
-            loss_b = self.alpha_b * self.loss_fn_beta(beta, a_index)
+            if self.weight_by_expert:
+                loss_b = self.alpha_b * (self.loss_fn_beta(beta, a_index) * w).sum() / self.batch
+            else:
+                loss_b = self.alpha_b * self.loss_fn_beta(beta, a_index)
 
             loss_r = self.alpha_r * self.loss_fn_r(reward, r)
 
             phi_tag = phi_tag.detach()
             loss_p = self.alpha_p * self.loss_fn_p(p, phi_tag)
-
 
             if self.alpha_v:
                 self.optimizer_v.zero_grad()
@@ -216,6 +224,14 @@ class BehavioralHotAgent(Agent):
                 self.optimizer_p.zero_grad()
                 loss_p.backward()
                 self.optimizer_p.step()
+
+                # param = self.model.fc_z_p.bias.data.cpu().numpy()
+                # if np.isnan(param.max()):
+                #     print("XXX")
+                # paramgrad = self.model.fc_z_p.bias.grad.data.cpu().numpy()
+                # param_l = loss_q.data.cpu().numpy()[0]
+                # print("max: %g | min: %g | max_grad: %g | min_grad: %g | loss: %g " % (param.max(), param.min(), paramgrad.max(), paramgrad. min(), param_l))
+
 
             # add results
             results['loss_q'].append(loss_q.data.cpu().numpy()[0])
@@ -265,6 +281,7 @@ class BehavioralHotAgent(Agent):
             k = Variable(sample['k'].cuda(async=True).unsqueeze(1), requires_grad=False)
             a_index = Variable(sample['a_index'].cuda(async=True), requires_grad=False)
             score = Variable(sample['score'].cuda(async=True).unsqueeze(1), requires_grad=False)
+            w = Variable(sample['w'].cuda(), requires_grad=False)
 
             f = Variable(sample['f'].cuda(async=True).unsqueeze(1), requires_grad=False)
             indexes = sample['i']
@@ -277,7 +294,12 @@ class BehavioralHotAgent(Agent):
 
             loss_v = self.alpha_v * self.loss_fn_value(value, f + self.final_score_reward * score)
             loss_q = self.alpha_q * self.loss_fn_q(q, f + self.final_score_reward * score)
-            loss_b = self.alpha_b * self.loss_fn_beta(beta, a_index)
+
+            if self.weight_by_expert:
+                loss_b = self.alpha_b * (self.loss_fn_beta(beta, a_index) * w).sum() / self.batch
+            else:
+                loss_b = self.alpha_b * self.loss_fn_beta(beta, a_index)
+
             loss_r = self.alpha_r * self.loss_fn_r(reward, r)
 
             phi_tag = Variable(phi_tag.data, requires_grad=False)
@@ -395,10 +417,22 @@ class BehavioralHotAgent(Agent):
                     indices = np.argsort(beta_np)
 
                     # maskb = Variable(torch.FloatTensor([i in indices[14:18] for i in range(18)]), requires_grad=False)
-                    maskb = Variable(torch.FloatTensor([0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), requires_grad=False)
-                    maskb = maskb.cuda()
+                    # maskb = Variable(torch.FloatTensor([1, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), requires_grad=False)
+                    # maskb = maskb.cuda()
+                    # pi = maskb * (q / q.max())
 
-                    pi = maskb * (q / q.max())
+                    maskb = Variable(torch.FloatTensor([1, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), requires_grad=False)
+                    maskb = maskb.cuda()
+                    pi = maskb * (beta / beta.max())
+                    # pi = maskb * (q / q.max())
+                    self.greedy = False
+
+                    # if j%2:
+                    #     pi = maskb * (q / q.max())
+                    #     self.greedy = True
+                    # else:
+                    #     self.greedy = False
+                    #     pi = maskb * (beta / beta.max())
                     # pi = (beta > 3).float() * (q / q.max())
 
                     # pi = beta  # (beta > 5).float() * (q / q.max())

@@ -31,7 +31,7 @@ class Agent(object):
         self.update_n_steps_interval = args.update_n_steps_interval
         self.update_memory_interval = args.update_memory_interval
         self.value_advantage = args.value_advantage
-        self.action_space = consts.n_actions[args.game]
+        # self.action_space = consts.n_actions[args.game]
         self.global_action_space = consts.action_space
         self.decay = args.decay
         self.myopic = args.myopic
@@ -40,7 +40,20 @@ class Agent(object):
         self.skip = args.skip
         self.greedy = args.greedy
         self.imitation = args.imitation
-        self.final_score_reward = args.final_score_reward
+        self.termination_reward = args.termination_reward
+        self.weight_by_expert = args.weight_by_expert
+        self.wasserstein = args.wasserstein
+        self.atoms_short = args.atoms_short
+        self.atoms_long = args.atoms_long
+        self.quantile = args.quantile
+        self.horizon = args.horizon
+        self.mask_horizon_matrix = consts.mask_horizon_matrix
+        self.horizon_action_matrix = consts.horizon_action_matrix
+        self.parallel = args.parallel
+        self.input_actions = args.input_actions
+        self.behavioral_threshold = args.behavioral_threshold
+        self.gradient_second = args.gradient_second
+        self.balance = args.balance
 
     @staticmethod
     def set_optimizer(params, lr=args.lr):
